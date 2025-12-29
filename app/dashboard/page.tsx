@@ -1,8 +1,7 @@
-//app/dashboard/page.tsx
-
+// app/dashboard/page.tsx
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Card,
   CardContent,
@@ -29,12 +28,9 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 
-/**
- * Interface for Cloudinary Video Analytics data
- */
 interface CloudinaryView {
   video_public_id: string;
-  video_duration: number;
+  video_duration: number | null;
   viewer_application_name: string;
   viewer_location_country_code: string;
   viewer_os_identifier: string;
@@ -42,177 +38,264 @@ interface CloudinaryView {
   view_ended_at: string;
 }
 
-const MOCK_DATA: CloudinaryView[] = [
-  {
-    video_public_id: 'demo',
-    video_duration: 60,
-    viewer_application_name: 'Chrome',
-    viewer_location_country_code: 'US',
-    viewer_os_identifier: 'Mac OS',
-    view_watch_time: 48,
-    view_ended_at: '2025-12-29',
-  },
-  {
-    video_public_id: 'demo',
-    video_duration: 60,
-    viewer_application_name: 'Safari',
-    viewer_location_country_code: 'GB',
-    viewer_os_identifier: 'iOS',
-    view_watch_time: 15,
-    view_ended_at: '2025-12-29',
-  },
-  {
-    video_public_id: 'demo',
-    video_duration: 60,
-    viewer_application_name: 'Chrome',
-    viewer_location_country_code: 'KE',
-    viewer_os_identifier: 'Android',
-    view_watch_time: 58,
-    view_ended_at: '2025-12-29',
-  },
-];
+const POLL_MS = 15000; // 15s feels sane
+
+function dedupeAndSort(rows: CloudinaryView[]) {
+  const map = new Map<string, CloudinaryView>();
+
+  for (const v of rows) {
+    const key = [
+      v.video_public_id,
+      v.view_ended_at,
+      v.viewer_application_name,
+      v.viewer_location_country_code,
+      v.viewer_os_identifier,
+    ].join('|');
+
+    const prev = map.get(key);
+    if (!prev || (v.view_watch_time ?? 0) > (prev.view_watch_time ?? 0)) {
+      map.set(key, v);
+    }
+  }
+
+  return Array.from(map.values()).sort(
+    (a, b) => +new Date(b.view_ended_at) - +new Date(a.view_ended_at)
+  );
+}
+
+function toStatus(err: unknown): number {
+  if (err instanceof Error) {
+    const n = Number(err.message);
+    if (Number.isFinite(n)) return n;
+  }
+  return 502;
+}
 
 export default function AnalyticsDashboard() {
-  const [data, setData] = useState<CloudinaryView[]>([]);
+  const [rows, setRows] = useState<CloudinaryView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<number | null>(null);
+  const [isDemo, setIsDemo] = useState(false);
+
+  const inFlightRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
 
   const publicId =
     'samples/analytics-demo/024_Automated_Brand_Review_with_Cloudinary_Moderation';
 
-  const fetchAnalytics = useCallback(
-    async (useMock = false) => {
-      if (useMock) {
-        setData(MOCK_DATA);
-        setLoading(false);
-        setError(null);
+  const fetchAnalytics = useCallback(async () => {
+    if (isDemo) return;
+
+    // Prevent overlap
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+
+    // Abort any previous request just in case
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    setLoading(true);
+
+    try {
+      const res = await fetch(
+        `/api/analytics?publicId=${encodeURIComponent(publicId)}`,
+        {
+          cache: 'no-store',
+          signal: controller.signal,
+        }
+      );
+
+      if (!res.ok) {
+        setRows([]);
+        setError(res.status);
         return;
       }
 
-      setLoading(true);
-      try {
-        const res = await fetch(
-          `/api/analytics?publicId=${encodeURIComponent(publicId)}`
-        );
-        if (!res.ok) throw new Error(`${res.status}`);
-        const json = await res.json();
-        setData(json.data || []);
-        setError(null);
-      } catch {
-        // Replaced unused 'err' with empty catch block for Next.js 16/ESLint standards
-        setError(504);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [publicId]
-  );
+      const json: unknown = await res.json();
+      const data = (json as { data?: CloudinaryView[] }).data;
 
+      setRows(Array.isArray(data) ? data : []);
+      setError(null);
+    } catch (err: unknown) {
+      // If we aborted, ignore.
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+
+      setRows([]);
+      setError(toStatus(err));
+    } finally {
+      setLoading(false);
+      inFlightRef.current = false;
+    }
+  }, [publicId, isDemo]);
+
+  // Initial fetch (dev Strict Mode safe)
   useEffect(() => {
     fetchAnalytics();
   }, [fetchAnalytics]);
 
-  if (loading)
+  // Polling with no overlap
+  useEffect(() => {
+    if (isDemo) return;
+
+    const id = window.setInterval(() => {
+      fetchAnalytics();
+    }, POLL_MS);
+
+    return () => window.clearInterval(id);
+  }, [fetchAnalytics, isDemo]);
+
+  const data = useMemo(() => dedupeAndSort(rows), [rows]);
+
+  const avgWatch = useMemo(() => {
+    if (!data.length) return 0;
+    const total = data.reduce((s, v) => s + (v.view_watch_time || 0), 0);
+    return Math.round(total / data.length);
+  }, [data]);
+
+  const countries = useMemo(() => {
+    return new Set(
+      data.map((v) => v.viewer_location_country_code).filter(Boolean)
+    ).size;
+  }, [data]);
+
+  if (loading && !rows.length && !error) {
     return (
       <div className='flex flex-col items-center justify-center min-h-screen bg-slate-50'>
         <div className='animate-spin rounded-full h-10 w-10 border-b-2 border-indigo-600 mb-4' />
-        <p className='text-slate-500 font-medium'>
-          Connecting to Cloudinary API...
-        </p>
+        <p className='text-slate-500 font-medium'>Loading analytics...</p>
       </div>
     );
+  }
 
-  if (error === 504)
+  if (error && !rows.length) {
     return (
       <div className='flex items-center justify-center min-h-screen bg-slate-50 p-6'>
         <Card className='max-w-md w-full p-6 text-center shadow-lg'>
           <AlertCircle className='w-12 h-12 text-red-500 mx-auto mb-4' />
-          <h2 className='text-xl font-bold mb-2'>Network Timeout</h2>
+          <h2 className='text-xl font-bold mb-2'>Analytics Error</h2>
           <p className='text-sm text-slate-500 mb-6'>
-            Could not reach Cloudinary analytics. This is often a network
-            restriction.
+            Could not load analytics. Status: {error}.
           </p>
+
           <div className='flex gap-2'>
             <Button
               onClick={() => fetchAnalytics()}
               variant='outline'
               className='flex-1'
             >
-              <RefreshCcw className='w-4 h-4 mr-2' /> Retry
+              <RefreshCcw className='w-4 h-4 mr-2' />
+              Retry
             </Button>
+
             <Button
-              onClick={() => fetchAnalytics(true)}
+              onClick={() => {
+                // Demo off for now. Keep your MOCK_DATA if you want.
+                setIsDemo(true);
+                setError(null);
+              }}
               className='flex-1 bg-indigo-600 hover:bg-indigo-700'
             >
-              Preview Demo
+              Demo
             </Button>
           </div>
         </Card>
       </div>
     );
-
-  const avgWatch = Math.round(
-    data.reduce((s, v) => s + v.view_watch_time, 0) / (data.length || 1)
-  );
+  }
 
   return (
     <main className='p-6 md:p-12 bg-slate-50 min-h-screen space-y-8'>
       <header className='flex flex-col md:flex-row justify-between items-start md:items-center gap-4'>
         <div>
           <h1 className='text-3xl font-black text-slate-900 tracking-tight'>
-            Stop Guessing, Start Growing
+            Video Analytics
           </h1>
-          <p className='text-slate-500'>Video Insights Powered by Cloudinary</p>
+          <p className='text-slate-500'>Updates every {POLL_MS / 1000}s.</p>
+          {error ? (
+            <p className='text-sm text-red-600'>
+              Last refresh failed: {error}.
+            </p>
+          ) : null}
         </div>
-        <Badge
-          className={
-            data === MOCK_DATA
-              ? 'bg-amber-100 text-amber-700'
-              : 'bg-green-100 text-green-700'
-          }
-        >
-          {data === MOCK_DATA ? 'Demo Mode' : 'Live Feed'}
-        </Badge>
+
+        <div className='flex items-center gap-2'>
+          <Badge
+            className={
+              isDemo
+                ? 'bg-amber-100 text-amber-700'
+                : 'bg-green-100 text-green-700'
+            }
+          >
+            {isDemo ? 'Demo Mode' : 'Live Feed'}
+          </Badge>
+
+          <Button
+            onClick={() => fetchAnalytics()}
+            variant='outline'
+            size='sm'
+            disabled={inFlightRef.current}
+          >
+            <RefreshCcw className='w-4 h-4 mr-2' />
+            Refresh
+          </Button>
+        </div>
       </header>
 
       <Card className='bg-indigo-600 text-white border-none shadow-xl'>
         <CardHeader className='flex flex-row items-center space-x-4'>
           <Zap className='w-8 h-8 fill-amber-400 text-amber-400' />
           <div>
-            <CardTitle>Growth Strategy</CardTitle>
+            <CardTitle>Watch Quality</CardTitle>
             <CardDescription className='text-indigo-100'>
               {avgWatch < 30
-                ? 'Retention Alert: High drop-off. Move your branding to the first 3 seconds!'
-                : 'Strong Engagement: Your audience is watching! Maintain this content format.'}
+                ? 'High drop-off. Put your key message in the first 3 seconds.'
+                : 'Good engagement. Keep this style and pacing.'}
             </CardDescription>
           </div>
         </CardHeader>
       </Card>
 
       <div className='grid grid-cols-1 md:grid-cols-3 gap-6'>
-        <StatCard title='Total Plays' value={data.length} icon={<Play />} />
-        <StatCard title='Avg. Watch' value={`${avgWatch}s`} icon={<Clock />} />
-        <StatCard
-          title='Countries'
-          value={
-            [...new Set(data.map((v) => v.viewer_location_country_code))].length
-          }
-          icon={<MapPin />}
-        />
+        <StatCard title='Total Views' value={data.length} icon={<Play />} />
+        <StatCard title='Avg Watch' value={`${avgWatch}s`} icon={<Clock />} />
+        <StatCard title='Countries' value={countries} icon={<MapPin />} />
       </div>
 
       <Card className='border-none shadow-sm'>
         <CardHeader>
           <CardTitle>Engagement Timeline</CardTitle>
         </CardHeader>
+
         <CardContent className='h-64'>
           <ResponsiveContainer width='100%' height='100%'>
             <AreaChart
-              data={data.map((v, i) => ({ n: i, s: v.view_watch_time }))}
+              data={data
+                .slice()
+                .reverse()
+                .map((v, i) => ({
+                  n: i,
+                  s: v.view_watch_time || 0,
+                  t: new Date(v.view_ended_at).toLocaleString(),
+                }))}
             >
               <CartesianGrid strokeDasharray='3 3' vertical={false} />
               <XAxis dataKey='n' hide />
-              <Tooltip />
+              <Tooltip
+                formatter={(value: unknown, _name: unknown, item: unknown) => {
+                  const payload =
+                    typeof item === 'object' &&
+                    item !== null &&
+                    'payload' in item
+                      ? (item as { payload?: { t?: string } }).payload
+                      : undefined;
+
+                  const label = payload?.t ?? '';
+                  const num = typeof value === 'number' ? value : Number(value);
+
+                  return [Number.isFinite(num) ? num : 0, label];
+                }}
+              />
               <Area
                 type='monotone'
                 dataKey='s'
