@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { BarChart3, Menu, PlayCircle, X, Zap } from 'lucide-react';
-import { useEffect, useMemo, useState, useTransition } from 'react';
+import { startTransition, useEffect, useMemo, useState } from 'react';
 import { cn } from '@/lib/utils';
 
 type NavItem = {
@@ -15,7 +15,6 @@ type NavItem = {
 export default function Navbar() {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
-  const [, startTransition] = useTransition();
 
   const navItems: NavItem[] = useMemo(
     () => [
